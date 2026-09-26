@@ -1,5 +1,0 @@
-networkx>=3.0
-openai>=1.40
-tenacity>=8.2
-tqdm>=4.66
-PyYAML>=6.0

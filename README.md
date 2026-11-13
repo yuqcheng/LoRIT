@@ -4,7 +4,7 @@
 
     pip install -r requirements.txt
 
-## Serve a local model (optional)
+## Serve a local model with vLLM (optional)
 
     pip install vllm
     MODEL_DIR=/path/to/model PORT=8000 NOTHINK=1 ./scripts/serve_local.sh

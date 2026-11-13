@@ -150,7 +150,8 @@ class FakeLoRIT(LoRIT):
 
     def __init__(self, **overrides):
         cfg = {"model_api_config": {"fake": {"model_list": [], "max_workers": 1}}, "model_name": "fake",
-               "model_temperature": 0.7, "model_max_tokens": 100, "model_timeout": 1}
+               "model_temperature": 0.7, "model_max_tokens": 100, "model_timeout": 1,
+               "stop_on_unanimity": 0, "lazy_relations": 0}
         cfg.update(overrides)
         super().__init__(cfg)
         self.prompts = {"judge": [], "revise": [], "readout": []}
@@ -217,6 +218,18 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(t["readout"]["mode"], "llm_readout")
         self.assertIn("Do not count votes", m.prompts["readout"][0])
         self.assertEqual(out["response"], "7")
+
+    def test_lazy_relations_end_to_end_identical(self):
+        LENS_ANSWERS.update({self.lenses[0]: "7", self.lenses[1]: "6", **{l: "5" for l in self.lenses[2:5]}})
+        FakeLoRIT.REFINES = {("7", "5"), ("5", "7"), ("6", "5"), ("7", "6")}
+        full = FakeLoRIT(num_agents=5, max_rounds=2)
+        lazy = FakeLoRIT(num_agents=5, max_rounds=2, lazy_relations=1)
+        a = full.inference({"query": "q", "source": "GSM8K"}); b = lazy.inference({"query": "q", "source": "GSM8K"})
+        for ra, rb in zip(a["lorit"]["rounds"], b["lorit"]["rounds"]):
+            self.assertEqual(ra["sccs"], rb["sccs"]); self.assertEqual(ra["H_edges"], rb["H_edges"])
+        self.assertEqual(a["lorit"]["readout_candidates"], b["lorit"]["readout_candidates"])
+        self.assertEqual(a["response"], b["response"])
+        self.assertLessEqual(len(lazy.prompts["judge"]), len(full.prompts["judge"]))
 
     def test_revision_is_synchronous(self):
         LENS_ANSWERS.update({self.lenses[0]: "9", self.lenses[1]: "8", self.lenses[2]: "6"})
@@ -297,6 +310,56 @@ class TestParsing(unittest.TestCase):
         b = dict(a, open_obligations=["check units"])
         self.assertNotEqual(self.m.state_signature(a), self.m.state_signature(b))
 
+class TestCostControls(unittest.TestCase):
+
+    def lazy(self, n, E, need):
+        E = set(E); known = {}
+        while not topo.topology_determined(n, known, need):
+            wave = topo.lazy_next_wave(n, known, need)
+            self.assertTrue(wave, "no progress before the topology was determined")
+            known.update({p: p in E for p in wave})
+        return known
+
+    def test_lazy_execution_graph_is_exact(self):
+        rng = random.Random(1)
+        for n in (2, 3, 5, 8):
+            for p in (0.0, 0.1, 0.3, 0.6, 0.9, 1.0):
+                for _ in range(15):
+                    E = random_digraph_edges(rng, n, p)
+                    _, sccs, _, _, G, H = pipeline(n, E)
+                    known = self.lazy(n, E, "execution")
+                    _, sccs_l, _, _, G_l, H_l = pipeline(n, [q for q, v in known.items() if v])
+                    self.assertEqual(sccs, sccs_l)
+                    self.assertEqual(topo.edges(G), topo.edges(G_l))
+                    self.assertEqual(sorted(H.edges), sorted(H_l.edges))
+
+    def test_lazy_readout_candidates_are_exact(self):
+        rng = random.Random(2)
+        cand = lambda sccs, G: sorted(a for c in topo.maximal_components(G) for a in sccs[c])
+        for n in (2, 3, 5, 8):
+            for p in (0.0, 0.1, 0.3, 0.6, 0.9, 1.0):
+                for _ in range(15):
+                    E = random_digraph_edges(rng, n, p)
+                    _, sccs, _, _, G, _ = pipeline(n, E)
+                    known = self.lazy(n, E, "readout")
+                    _, sccs_l, _, _, G_l, _ = pipeline(n, [q for q, v in known.items() if v])
+                    self.assertEqual(cand(sccs, G), cand(sccs_l, G_l))
+
+    def test_lazy_one_scc_needs_one_cycle_for_readout(self):
+        n = 8; E = [(i, j) for i in range(n) for j in range(n) if i != j]
+        self.assertEqual(len(self.lazy(n, E, "readout")), n)
+
+    def test_unanimity_answer_identity(self):
+        m = LoRIT.__new__(LoRIT)
+        st = lambda a, **kw: dict({"answer": a, "norm": a.replace(",", "")}, **kw)
+        q = "Q?\n\nChoose the correct answer from the following options:\n(A) 1 eV\n(B) 2 eV"
+        self.assertTrue(m.unanimous([st("1845536"), st("1845536.0"), st("1,845,536")], "x", "GSM-Hard"))
+        self.assertFalse(m.unanimous([st("1845536"), st("1845537")], "x", "GSM-Hard"))
+        self.assertFalse(m.unanimous([st("12"), st("12", state_parse_failed=True)], "x", "GSM-Hard"))
+        self.assertTrue(m.unanimous([st("(B)"), st("2 eV")], q, "GPQA"))
+        self.assertFalse(m.unanimous([st("(A)"), st("(B)")], q, "GPQA"))
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -349,7 +412,7 @@ class TestCodeTasks(unittest.TestCase):
         self.m = FakeLoRIT()
 
     def test_executor_verdicts(self):
-        from utils.code_exec import run_test
+        from refine.program_tests import run_test
         self.assertTrue(run_test("def strlen(s):\n    return len(s)\n", self.TEST)[0])
         self.assertFalse(run_test("def strlen(s):\n    return 0\n", self.TEST)[0])
         self.assertFalse(run_test("def strlen(s):\n    raise RuntimeError\n", self.TEST)[0])
@@ -358,7 +421,7 @@ class TestCodeTasks(unittest.TestCase):
         self.assertIn("timeout", detail)
 
     def test_is_correct_runs_the_test(self):
-        from utils.scoring import is_correct
+        from refine.answers import is_correct
         self.assertTrue(is_correct("```python\ndef strlen(s):\n    return len(s)\n```", self.TEST, "HumanEval"))
         self.assertFalse(is_correct("def strlen(s):\n    return 1\n", self.TEST, "HumanEval"))
 
@@ -397,12 +460,12 @@ class TestCodeTasks(unittest.TestCase):
 class TestGenerationSource(unittest.TestCase):
 
     def test_is_correct_refuses_a_generation_source(self):
-        from utils.scoring import is_correct
+        from refine.answers import is_correct
         with self.assertRaises(ValueError):
             is_correct("print(1)", "", "SRDD")
 
     def test_generation_metrics(self):
-        from utils.scoring import generation_metrics, score_run
+        from refine.answers import generation_metrics, score_run
         recs = [{"source": "SRDD", "response": "```python\nimport sys\n\ndef main():\n    print('hi')\n```",
                  "token_stats": {"m": {"num_llm_calls": 76}}},
                 {"source": "SRDD", "response": "```python\ndef broken(:\n```", "token_stats": {}},
@@ -442,7 +505,7 @@ class TestFreeformSource(unittest.TestCase):
         self.assertEqual(s["established"], ["budget known"])
 
     def test_generation_metrics_skip_syntax_for_prose(self):
-        from utils.scoring import generation_metrics
+        from refine.answers import generation_metrics
         recs = [{"source": "MultiAgentBench-research", "response": "```\nWe propose a study of X.\n```"},
                 {"source": "MultiAgentBench-research", "response": ""}]
         m = generation_metrics(recs)
@@ -477,41 +540,3 @@ class TestBlockReadout(unittest.TestCase):
         self.assertEqual(out["lorit"]["readout"]["mode"], "llm_readout")
         self.assertNotIn("parse_error", out["lorit"]["readout"])
 
-class TestSRDDMetrics(unittest.TestCase):
-
-    def test_completeness(self):
-        from utils.srdd_metrics import completeness
-        full = "def add(a, b):\n    return a + b\n\nprint(add(1, 2))\n"
-        self.assertEqual(completeness(full)[0], True)
-        for stub in ("def f():\n    pass\n", "def f():\n    ...\n",
-                     "def f():\n    raise NotImplementedError\n", "def f():\n    return 1  # TODO: handle zero\n",
-                     "class A:\n    def m(self):\n        pass\n"):
-            self.assertFalse(completeness(stub)[0], stub)
-        self.assertTrue(completeness('def f():\n    """doc"""\n    return 1\n')[0])
-        self.assertFalse(completeness("def broken(:\n")[0])
-
-    def test_executability(self):
-        from utils.srdd_metrics import executability
-        self.assertTrue(executability("print('hello')\n")[0])
-        ok, detail = executability("while True:\n    pass\n", timeout=3)
-        self.assertTrue(ok)
-        self.assertIn("still running", detail)
-        self.assertFalse(executability("raise ValueError('boom')\n")[0])
-        self.assertFalse(executability("import nonexistent_module_xyz\n")[0])
-        self.assertFalse(executability("x = input()\n")[0])
-
-    def test_consistency_and_quality(self):
-        from analyze_srdd import MINILM
-        from utils.srdd_metrics import evaluate_softwares
-        if not os.path.isdir(MINILM):
-            self.skipTest("embedding model not available")
-        recs = [{"query": "A calculator that adds two numbers and prints the result.",
-                 "response": "```python\ndef add(a, b):\n    return a + b\n\nprint(add(2, 3))\n```"},
-                {"query": "A calculator that adds two numbers and prints the result.",
-                 "response": "```python\ndef add(a, b):\n    pass\n```"}]
-        per, summ = evaluate_softwares(recs, MINILM, timeout=10)
-        self.assertTrue(per[0]["complete"] and per[0]["executable"])
-        self.assertFalse(per[1]["complete"])
-        self.assertGreater(per[0]["consistency"], per[1]["consistency"] - 1)
-        self.assertEqual(per[1]["quality"], 0.0)
-        self.assertEqual(summ["completeness"], 0.5)

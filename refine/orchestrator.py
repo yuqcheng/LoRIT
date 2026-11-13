@@ -4,10 +4,12 @@ import json
 import random
 import re
 
+import networkx as nx
+
 from .backend import Backend
 from . import graph as topo
 from .program_tests import extract_code
-from .answers import normalize_answer
+from .answers import normalize_answer, answer_to_letter, MC_SOURCES
 
 class LoRIT(Backend):
 
@@ -70,7 +72,7 @@ class LoRIT(Backend):
         for k in ("role_mode", "num_agents", "max_rounds", "temperature", "lenses",
                   "transitive_reduction", "cross_component_lifting", "max_state_chars",
                   "judge_model", "judge_max_tokens", "rel_prompt", "judge_workers",
-                  "tool_checks", "max_checks"):
+                  "tool_checks", "max_checks", "stop_on_unanimity", "lazy_relations", "judge_reasoning_chars"):
             v = general_config.get(k)
             if v is not None:
                 mc[k] = v
@@ -101,7 +103,8 @@ class LoRIT(Backend):
         self.max_checks = int(mc.get("max_checks", 3))
         self.rel_prompt = mc.get("rel_prompt", "strict")
         variants = {"strict": self._REL_SYS, "balanced": self._REL_SYS_BALANCED,
-                    "obligation": self._REL_SYS_OBLIGATION}
+                    "obligation": self._REL_SYS_OBLIGATION, "concise": self._REL_SYS_CONCISE,
+                    "concise_verdict": self._REL_SYS_CONCISE_VERDICT}
         if self.rel_prompt not in variants:
             raise ValueError(f"rel_prompt must be one of {sorted(variants)}; got {self.rel_prompt!r}")
         self._REL_SYS = variants[self.rel_prompt]
@@ -118,6 +121,11 @@ class LoRIT(Backend):
         self.readout_temperature = float(mc.get("readout_temperature", 0.0))
         self.max_state_chars = mc.get("max_state_chars", 6000)
         self.check_invariants = self._as_bool(mc.get("check_invariants", True))
+        self.stop_on_unanimity = self._as_bool(mc.get("stop_on_unanimity", False))
+        self.lazy_relations = self._as_bool(mc.get("lazy_relations", False)) and self.lifting == "all_to_all"
+        self._skipped_pairs = 0
+        jrc = mc.get("judge_reasoning_chars")
+        self.judge_reasoning_chars = None if jrc is None or str(jrc).lower() in ("", "none") else int(jrc)
         self.max_workers = int(mc.get("max_workers", 8))
         self.random_seed = mc.get("random_seed", 2025)
         random.seed(self.random_seed)
@@ -140,13 +148,16 @@ class LoRIT(Backend):
                        "rel_prompt": self.rel_prompt, "tool_checks": self.tool_checks,
                        "lenses": [self.lenses[i % len(self.lenses)] for i in range(self.num_agents)],
                        "transitive_reduction": self.transitive_reduction,
-                       "cross_component_lifting": self.lifting},
+                       "cross_component_lifting": self.lifting,
+                       "stop_on_unanimity": self.stop_on_unanimity, "lazy_relations": self.lazy_relations,
+                       "judge_reasoning_chars": self.judge_reasoning_chars, "max_state_chars": self.max_state_chars},
             "initial_states": states,
             "rounds": [],
         }
 
         reusable = None
-        for t in range(self.max_rounds):
+        unanimous_at = 0 if (self.stop_on_unanimity and self.unanimous(states, query, source)) else None
+        for t in range(self.max_rounds if unanimous_at is None else 0):
             T = self.build_topology(query, states, phase=self.PH_REL)
             new_states, revised = self.revise_all_agents(query, source, states, T["H"])
 
@@ -165,13 +176,23 @@ class LoRIT(Backend):
                 states = new_states
                 break
             states = new_states
+            if self.stop_on_unanimity and self.unanimous(states, query, source):
+                rec["stop"] = "unanimous"
+                unanimous_at = t + 1
+                break
 
-        if reusable is not None:
-            final_T, final_src = reusable[1], f"round_{reusable[0]}_unrevised"
+        if unanimous_at is not None:
+            final_T = {"judgments": [], "D": nx.DiGraph(), "sccs": [], "agent_to_component": {},
+                       "C": nx.DiGraph(), "G": nx.DiGraph(), "stats": {}}
+            final_src = f"skipped_unanimous_at_t{unanimous_at}"
+            answer = states[0]["answer"]
+            readout = {"maximal_components": [], "candidates": list(range(len(states))), "mode": "unanimous"}
         else:
-            final_T, final_src = self.final_refinement_topology(query, states), "rebuilt_from_final_states"
-
-        answer, readout = self.refinement_readout(query, source, states, final_T)
+            if reusable is not None:
+                final_T, final_src = reusable[1], f"round_{reusable[0]}_unrevised"
+            else:
+                final_T, final_src = self.final_refinement_topology(query, states), "rebuilt_from_final_states"
+            answer, readout = self.refinement_readout(query, source, states, final_T)
 
         log.update({
             "final_states": states,
@@ -183,6 +204,7 @@ class LoRIT(Backend):
             "final_C_edges": topo.edges(final_T["C"]),
             "final_G_edges": topo.edges(final_T["G"]),
             "final_stats": final_T["stats"],
+            "final_skipped_pairs": final_T.get("skipped_pairs", 0),
             "maximal_components": readout["maximal_components"],
             "readout_candidates": readout["candidates"],
             "readout": {k: v for k, v in readout.items() if k not in ("maximal_components", "candidates")},
@@ -227,8 +249,8 @@ class LoRIT(Backend):
 
     def infer_refinement(self, query, states, i, j, phase):
         prompt = (f"PROBLEM:\n{query}\n\n"
-                  f"[SOURCE STATE]\n{self._fmt(states[i])}\n\n"
-                  f"[TARGET STATE]\n{self._fmt(states[j])}\n\n"
+                  f"[SOURCE STATE]\n{self._fmt_judge(states[i])}\n\n"
+                  f"[TARGET STATE]\n{self._fmt_judge(states[j])}\n\n"
                   "Can the SOURCE state concretely refine the TARGET state? Judge only SOURCE -> TARGET. "
                   "Reply with the JSON object only.")
         raw = self.call_llm(prompt=prompt, system_prompt=self._REL_SYS, model_name=self.judge_model,
@@ -242,9 +264,21 @@ class LoRIT(Backend):
 
     def infer_refinement_graph(self, query, states, phase):
         n = len(states)
-        pairs = [(i, j) for i in range(n) for j in range(n) if i != j]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.judge_workers or self.max_workers) as ex:
-            judgments = list(ex.map(lambda p: self.infer_refinement(query, states, p[0], p[1], phase), pairs))
+        judge = lambda p: self.infer_refinement(query, states, p[0], p[1], phase)
+        workers = self.judge_workers or self.max_workers
+        if not self.lazy_relations:
+            pairs = [(i, j) for i in range(n) for j in range(n) if i != j]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                judgments = list(ex.map(judge, pairs))
+            self._skipped_pairs = 0
+            return topo.refinement_graph_from_judgments(n, judgments), judgments
+        need = "readout" if phase == self.PH_REL_FINAL else "execution"
+        judgments, known = [], {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            while not topo.topology_determined(n, known, need):
+                for jd in ex.map(judge, topo.lazy_next_wave(n, known, need)):
+                    judgments.append(jd); known[(jd["source"], jd["target"])] = jd["refines"] is True
+        self._skipped_pairs = n * (n - 1) - len(judgments)
         return topo.refinement_graph_from_judgments(n, judgments), judgments
 
     def build_topology(self, query, states, phase):
@@ -255,7 +289,7 @@ class LoRIT(Backend):
         if self.check_invariants:
             topo.check_invariants(D, sccs, a2c, C, G, H, self.lifting)
         return {"judgments": judgments, "D": D, "sccs": sccs, "agent_to_component": a2c, "C": C, "G": G,
-                "H": H, "stats": topo.topology_statistics(D, C, G, H, sccs)}
+                "H": H, "stats": topo.topology_statistics(D, C, G, H, sccs), "skipped_pairs": self._skipped_pairs}
 
     def final_refinement_topology(self, query, states):
         return self.build_topology(query, states, phase=self.PH_REL_FINAL)
@@ -305,6 +339,20 @@ class LoRIT(Backend):
         info["parse_error"] = True
         return str(raw or "").strip(), info
 
+    def answer_key(self, s, query, source):
+        if s.get("state_parse_failed") or self._block_answer(source) or self._is_freeform(source):
+            return None
+        if (source or "").upper() in MC_SOURCES:
+            return answer_to_letter(s.get("answer"), query)
+        try:
+            return f"{round(float(s.get('norm')), 2):.2f}"
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def unanimous(self, states, query, source):
+        keys = [self.answer_key(s, query, source) for s in states]
+        return keys[0] is not None and all(k == keys[0] for k in keys)
+
     def state_signature(self, s):
         norm = lambda x: " ".join(str(x).lower().split())
         return (s.get("norm", ""), norm(s.get("reasoning", "")),
@@ -321,6 +369,7 @@ class LoRIT(Backend):
             "G_edges": topo.edges(T["G"]),
             "H_edges": [[int(i), int(j), T["H"].edges[i, j]["kind"]] for i, j in sorted(T["H"].edges)],
             "stats": T["stats"],
+            "skipped_pairs": T.get("skipped_pairs", 0),
         }
 
     def _revision_events(self, t, before, after, T):
@@ -418,6 +467,18 @@ class LoRIT(Backend):
         '"witness": "<what in SOURCE settles it, or empty>", '
         '"refines": true or false}'
     )
+
+    _REL_SYS_CONCISE = (
+        "For the same problem, does SOURCE provide actionable reasoning to fix a specific weakness in TARGET? "
+        "Agreement, answer differences, verbosity, confidence, or repetition alone do not qualify. "
+        "Judge SOURCE\u2192TARGET independently; both directions may hold.\n"
+        "Output exactly one JSON object and nothing else:\n"
+        '{"target_issue": "<the specific weakness in TARGET, or empty>", '
+        '"witness": "<the concrete content in SOURCE that resolves it, or empty>", '
+        '"refines": true or false}'
+    )
+    _REL_SYS_CONCISE_VERDICT = _REL_SYS_CONCISE.split("Output exactly")[0] + (
+        'Output exactly one JSON object and nothing else: {"refines": true or false}')
 
     _READOUT_SYS = (
         "You produce the final answer of a multi-agent reasoning system from its remaining candidate "
@@ -575,6 +636,17 @@ class LoRIT(Backend):
         if extra > 0:
             lines.append(f"  [VERIFIED EARLIER] {extra} check(s) from a previous round still hold")
         return "\nTOOL CHECKS (run in a sandbox, not written by the grader):\n" + "\n".join(lines) + "\n"
+
+    def _fmt_judge(self, s):
+        n = self.judge_reasoning_chars
+        if n is None or s.get("state_parse_failed"):
+            return self._fmt(s)
+        r = str(s.get("reasoning", "") or "").strip()
+        if n <= 0:
+            r = "(not shown; judge from the answer, established facts and open obligations)"
+        elif len(r) > n:
+            r = r[:n // 2] + "\n[... middle of reasoning truncated ...]\n" + r[-(n - n // 2):]
+        return self._fmt({**s, "reasoning": r})
 
     def _fmt(self, s):
         if "\n" in str(s["answer"]):

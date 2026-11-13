@@ -95,3 +95,53 @@ def check_invariants(D, sccs, agent_to_component, C, G, H, lifting="all_to_all")
             assert nx.descendants(D, i) == nx.descendants(H, i), f"H changes reachability from agent {i}"
     else:
         assert set(H.edges) <= set(D.edges), "direct lifting introduced an unwitnessed edge"
+
+
+def lazy_pair_batches(n):
+    cyc = [(i, (i + 1) % n) for i in range(n) if i != (i + 1) % n]
+    rev = [((i + 1) % n, i) for i in range(n) if i != (i + 1) % n and ((i + 1) % n, i) not in cyc]
+    rest = [(i, j) for i in range(n) for j in range(n) if i != j and (i, j) not in cyc and (i, j) not in rev]
+    pairs = list(dict.fromkeys(cyc + rev + rest))
+    return [pairs[k:k + n] for k in range(0, len(pairs), max(1, n))]
+
+
+def lazy_next_wave(n, known, need):
+    pos = [p for p, v in known.items() if v]
+    _, part = _partition(n, pos)
+    comp_of = {a: c for c in part for a in c}
+    order = [p for b in lazy_pair_batches(n) for p in b if p not in known]
+    intra = [p for p in order if comp_of[p[0]] == comp_of[p[1]]]
+    cross = [p for p in order if comp_of[p[0]] != comp_of[p[1]]][:n]
+    return (intra if need == "execution" else []) + cross
+
+
+def _partition(n, pos):
+    g = nx.DiGraph(); g.add_nodes_from(range(n)); g.add_edges_from(pos)
+    return g, frozenset(frozenset(c) for c in nx.strongly_connected_components(g))
+
+
+def _source_components(g, comps):
+    comp_of = {a: c for c in comps for a in c}
+    entered = {comp_of[v] for u, v in g.edges if comp_of[u] != comp_of[v]}
+    return frozenset(c for c in comps if c not in entered)
+
+
+def topology_determined(n, known, need):
+    pos = [p for p, v in known.items() if v]
+    unk = [(i, j) for i in range(n) for j in range(n) if i != j and (i, j) not in known]
+    g_lo, part_lo = _partition(n, pos)
+    g_hi, part_hi = _partition(n, pos + unk)
+    if part_lo != part_hi:
+        return False
+    if need == "readout":
+        return _source_components(g_lo, part_lo) == _source_components(g_hi, part_hi)
+    comp_of = {a: c for c in part_lo for a in c}
+    if any(comp_of[i] == comp_of[j] for i, j in unk):
+        return False
+    for a in part_lo:
+        for b in part_lo:
+            if a != b:
+                ps = [(i, j) for i in a for j in b]
+                if not any(known.get(p) for p in ps) and any(p not in known for p in ps):
+                    return False
+    return True

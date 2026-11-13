@@ -33,10 +33,34 @@ revision rounds, the role set, the wording of the relation, whether the judgment
 and whether agents may attach sandboxed checks whose passing results form a ledger that a revision may not
 drop.
 
+The default configuration is the low-cost one:
+
+- `stop_on_unanimity: true`. The run stops once every agent gives the same answer, and the remaining rounds,
+  the final topology and the readout are skipped.
+- `lazy_relations: true`. Ordered pairs are judged in batches only until the topology is fixed: the SCC
+  partition, every intra-component pair, and every condensation edge for the execution graph; the source
+  components for the readout. Every pair is a separate call at temperature 0, so this gives the same execution
+  graphs and readout candidates as judging every pair. With `direct` lifting all pairs are judged.
+- `rel_prompt: concise_verdict`. A short wording of the relation that asks for the verdict only.
+- `judge_reasoning_chars: 0`. The judge sees each state's answer, established facts and open obligations,
+  without the free-text reasoning.
+- `max_state_chars: 400`. At most 400 characters of a state's reasoning, head and tail, are printed into
+  another agent's revision prompt.
+
+For the full configuration, set `rel_prompt: strict`, `stop_on_unanimity: false`, `lazy_relations: false`,
+`judge_reasoning_chars: null` and `max_state_chars: 6000`.
+
 Backends are declared in `configs/backends.json`, modelled on `configs/backends.example.json`. A hosted key
 belongs in an environment variable named by `api_key_env`, never in the file. `max_tokens_param` and
 `no_temperature` adapt requests for reasoning models that rename the completion budget or reject a
 non-default temperature.
+
+## Serving a local model
+
+    MODEL_DIR=/path/to/model PORT=8000 NOTHINK=1 ./scripts/serve_local.sh
+
+`NOTHINK=1` applies `scripts/nothink.jinja`, which keeps hybrid-reasoning models in their non-thinking mode.
+`GPU_UTIL` (default 0.85) is a fraction of the whole card; lower it when the card is shared.
 
 ## Data
 

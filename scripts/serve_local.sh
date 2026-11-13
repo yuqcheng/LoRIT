@@ -1,11 +1,4 @@
 #!/bin/bash
-# Serve one local model with vLLM for the runs in this repository.
-#
-#   MODEL_DIR=/path/to/Qwen3-8B PORT=8000 ./scripts/serve_local.sh
-#
-# The chat template forces the hybrid-reasoning models used here into their non-thinking mode, so every arm is
-# measured on the same generation behaviour. GPU_UTIL is a fraction of the WHOLE card and must fit the memory
-# free at launch; lower it when the card is shared.
 set -euo pipefail
 : "${MODEL_DIR:?set MODEL_DIR to the local model directory}"
 cd "$(dirname "$0")"

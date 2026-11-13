@@ -27,7 +27,12 @@ def main():
         "model_max_tokens": cfg["max_tokens"],
         "model_timeout": cfg["timeout"],
     }
-    mas = LoRIT(general)
+    local = threading.local()
+
+    def worker_mas():
+        if getattr(local, "mas", None) is None:
+            local.mas = LoRIT(general)
+        return local.mas
     with open(os.path.join(ROOT, "data", f"{dataset}.json")) as f:
         data = json.load(f)
     out = os.path.join(ROOT, "runs", dataset, backend, "lorit.jsonl")
@@ -36,6 +41,8 @@ def main():
     lock = threading.Lock()
 
     def one(sample):
+        mas = worker_mas()
+        mas.reset_token_stats()
         try:
             rec = dict(sample)
             rec.update(mas.inference(sample))
@@ -43,7 +50,6 @@ def main():
         except Exception:
             rec = dict(sample)
             rec["error"] = traceback.format_exc()
-        mas.reset_token_stats()
         write_to_jsonl(lock, out, rec)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=cfg["item_workers"]) as ex:

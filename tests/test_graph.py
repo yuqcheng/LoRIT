@@ -1,6 +1,7 @@
 import itertools
 import os
 import random
+import json
 import re
 import sys
 import threading
@@ -147,11 +148,11 @@ LENS_ANSWERS = {}
 class FakeLoRIT(LoRIT):
 
     REFINES = set()
+    DROP = set()
 
     def __init__(self, **overrides):
         cfg = {"model_api_config": {"fake": {"model_list": [], "max_workers": 1}}, "model_name": "fake",
-               "model_temperature": 0.7, "model_max_tokens": 100, "model_timeout": 1,
-               "stop_on_unanimity": 0, "lazy_relations": 0}
+               "model_temperature": 0.7, "model_max_tokens": 100, "model_timeout": 1}
         cfg.update(overrides)
         super().__init__(cfg)
         self.prompts = {"judge": [], "revise": [], "readout": []}
@@ -168,6 +169,14 @@ class FakeLoRIT(LoRIT):
         if phase in (self.PH_REL, self.PH_REL_FINAL):
             with self._lock:
                 self.prompts["judge"].append(prompt)
+            if "[SOURCE STATE]" not in prompt:
+                tgt = ans(prompt.split("[TARGET STATE]")[1].split("[SOURCE ")[0])
+                out = {}
+                for part in prompt.split("[SOURCE ")[1:]:
+                    lab = part.split("]")[0]
+                    if lab not in self.DROP:
+                        out[lab] = (ans(part), tgt) in self.REFINES
+                return json.dumps(out)
             src = ans(prompt.split("[SOURCE STATE]")[1].split("[TARGET STATE]")[0])
             tgt = ans(prompt.split("[TARGET STATE]")[1])
             r = (src, tgt) in self.REFINES
@@ -201,7 +210,7 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(t["readout_candidates"], [0])
         self.assertEqual(t["readout"]["mode"], "single_candidate")
         self.assertEqual(m.prompts["readout"], [])
-        self.assertEqual(len(m.prompts["judge"]), 6)
+        self.assertEqual(len(m.prompts["judge"]), 3)
 
     def test_minority_source_beats_majority(self):
         LENS_ANSWERS.update({self.lenses[0]: "7", **{l: "5" for l in self.lenses[1:5]}})
@@ -212,24 +221,58 @@ class TestEndToEnd(unittest.TestCase):
         r0 = t["rounds"][0]
         self.assertEqual(r0["D_edges"], [[0, 1], [0, 2], [0, 3], [0, 4]])
         self.assertEqual(r0["revised_agents"], [1, 2, 3, 4])
-        self.assertEqual(t["rounds"][1]["stop"], "fixed_point")
-        self.assertEqual(t["final_topology_source"], "round_1_unrevised")
-        self.assertEqual(t["readout_candidates"], [0, 1, 2, 3, 4])
-        self.assertEqual(t["readout"]["mode"], "llm_readout")
-        self.assertIn("Do not count votes", m.prompts["readout"][0])
+        self.assertEqual(r0["stop"], "unanimous")
+        self.assertEqual(len(t["rounds"]), 1)
+        self.assertEqual(t["final_topology_source"], "skipped_unanimous_at_t1")
+        self.assertEqual(t["readout"]["mode"], "unanimous")
+        self.assertEqual(m.prompts["readout"], [])
         self.assertEqual(out["response"], "7")
 
-    def test_lazy_relations_end_to_end_identical(self):
-        LENS_ANSWERS.update({self.lenses[0]: "7", self.lenses[1]: "6", **{l: "5" for l in self.lenses[2:5]}})
-        FakeLoRIT.REFINES = {("7", "5"), ("5", "7"), ("6", "5"), ("7", "6")}
-        full = FakeLoRIT(num_agents=5, max_rounds=2)
-        lazy = FakeLoRIT(num_agents=5, max_rounds=2, lazy_relations=1)
-        a = full.inference({"query": "q", "source": "GSM8K"}); b = lazy.inference({"query": "q", "source": "GSM8K"})
-        for ra, rb in zip(a["lorit"]["rounds"], b["lorit"]["rounds"]):
-            self.assertEqual(ra["sccs"], rb["sccs"]); self.assertEqual(ra["H_edges"], rb["H_edges"])
-        self.assertEqual(a["lorit"]["readout_candidates"], b["lorit"]["readout_candidates"])
-        self.assertEqual(a["response"], b["response"])
-        self.assertLessEqual(len(lazy.prompts["judge"]), len(full.prompts["judge"]))
+    def test_unanimous_initial_answers_skip_all_rounds(self):
+        LENS_ANSWERS.update({l: "5" for l in self.lenses[:4]})
+        FakeLoRIT.REFINES = {("5", "5")}
+        m = FakeLoRIT(num_agents=4, max_rounds=2)
+        out = m.inference({"query": "q", "source": "GSM8K"})
+        self.assertEqual(out["response"], "5")
+        self.assertEqual(out["lorit"]["rounds"], [])
+        self.assertEqual(out["lorit"]["final_topology_source"], "skipped_unanimous_at_t0")
+        self.assertEqual(m.prompts["judge"], [])
+
+    def test_readout_prompt_forbids_votes(self):
+        m = FakeLoRIT()
+        st = {"answer": "7", "reasoning": "r", "established": [], "open_obligations": []}
+        self.assertIn("Do not count votes", m._readout_prompt("q", "GSM8K", [st, st]))
+
+    def test_unsettled_label_falls_back_to_a_pair_judgment(self):
+        LENS_ANSWERS.update({self.lenses[0]: "7", **{l: "5" for l in self.lenses[1:4]}})
+        FakeLoRIT.REFINES = {("7", "5")}
+        FakeLoRIT.DROP = {"S2"}
+        try:
+            m = FakeLoRIT(num_agents=4, max_rounds=0)
+            states = m.initialize_agents("q", "GSM8K")
+            D, js = m.infer_refinement_graph("q", states, m.PH_REL)
+        finally:
+            FakeLoRIT.DROP = set()
+        self.assertEqual(sorted(D.edges), [(0, 1), (0, 2), (0, 3)])
+        self.assertEqual(len(js), 12)
+        self.assertEqual(sum(1 for j in js if j.get("batch_fallback")), 4)
+
+    def test_unchanged_pairs_reuse_their_verdict(self):
+        LENS_ANSWERS.update({self.lenses[0]: "7", **{l: "5" for l in self.lenses[1:4]}})
+        FakeLoRIT.REFINES = {("7", "5")}
+        m = FakeLoRIT(num_agents=4, max_rounds=0)
+        states = m.initialize_agents("q", "GSM8K")
+        D1, _ = m.infer_refinement_graph("q", states, m.PH_REL)
+        self.assertEqual(len(m.prompts["judge"]), 4)
+        changed = [dict(states[0], established=["z"])] + states[1:]
+        D2, js = m.infer_refinement_graph("q", changed, m.PH_REL_FINAL)
+        self.assertEqual(sorted(D1.edges), sorted(D2.edges))
+        self.assertEqual(m._cached_pairs, 6)
+        self.assertEqual(sum(1 for j in js if j.get("cached")), 6)
+        self.assertEqual(len(m.prompts["judge"]), 8)
+        D3, js = m.infer_refinement_graph("q", changed, m.PH_REL_FINAL)
+        self.assertEqual(m._cached_pairs, 12)
+        self.assertEqual(len(m.prompts["judge"]), 8)
 
     def test_revision_is_synchronous(self):
         LENS_ANSWERS.update({self.lenses[0]: "9", self.lenses[1]: "8", self.lenses[2]: "6"})
@@ -250,8 +293,8 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(t["final_topology_source"], "rebuilt_from_final_states")
         self.assertEqual(t["rounds"][0]["D_edges"], [[0, 1], [1, 2]])
         self.assertEqual(t["final_D_edges"], [[0, 2], [1, 2]])
-        self.assertEqual(len(m.prompts["judge"]), 12)
-        self.assertEqual(t["token_usage"]["by_phase"]["relation_judgment_final"]["num_llm_calls"], 6)
+        self.assertEqual(len(m.prompts["judge"]), 6)
+        self.assertEqual(t["token_usage"]["by_phase"]["relation_judgment_final"]["num_llm_calls"], 3)
         self.assertEqual(t["readout_candidates"], [0, 1])
 
     def test_mutual_refinement_with_both_directions_true(self):
@@ -277,10 +320,11 @@ class TestParsing(unittest.TestCase):
         self.m = FakeLoRIT()
 
     def test_judgment_parse(self):
-        self.assertEqual(self.m._parse_judgment('{"target_issue": "a", "witness": "b", "refines": true}'),
-                         (True, "b", "a", True))
-        self.assertEqual(self.m._parse_judgment('Sure.\n{\n "refines": false\n}')[::3], (False, True))
-        self.assertEqual(self.m._parse_judgment("I think yes")[::3], (False, False))
+        self.assertEqual(self.m._parse_judgment('{"refines": true}'), (True, True))
+        self.assertEqual(self.m._parse_judgment('Sure.\n{\n "refines": false\n}'), (False, True))
+        self.assertEqual(self.m._parse_judgment("I think yes"), (False, False))
+        self.assertEqual(self.m._parse_target_verdicts('{"S1": true, "S2": "false"}', ["S1", "S2", "S3"]),
+                         {"S1": True, "S2": False})
 
     def test_state_parse_multiline_json_and_reasoning(self):
         raw = "Step 1: 16-3-4=9.\nStep 2: 9*2=18.\n{\n  \"answer\": \"18\",\n  \"established\": [\"9 eggs\"],\n  \"open_obligations\": []\n}"
@@ -310,44 +354,7 @@ class TestParsing(unittest.TestCase):
         b = dict(a, open_obligations=["check units"])
         self.assertNotEqual(self.m.state_signature(a), self.m.state_signature(b))
 
-class TestCostControls(unittest.TestCase):
-
-    def lazy(self, n, E, need):
-        E = set(E); known = {}
-        while not topo.topology_determined(n, known, need):
-            wave = topo.lazy_next_wave(n, known, need)
-            self.assertTrue(wave, "no progress before the topology was determined")
-            known.update({p: p in E for p in wave})
-        return known
-
-    def test_lazy_execution_graph_is_exact(self):
-        rng = random.Random(1)
-        for n in (2, 3, 5, 8):
-            for p in (0.0, 0.1, 0.3, 0.6, 0.9, 1.0):
-                for _ in range(15):
-                    E = random_digraph_edges(rng, n, p)
-                    _, sccs, _, _, G, H = pipeline(n, E)
-                    known = self.lazy(n, E, "execution")
-                    _, sccs_l, _, _, G_l, H_l = pipeline(n, [q for q, v in known.items() if v])
-                    self.assertEqual(sccs, sccs_l)
-                    self.assertEqual(topo.edges(G), topo.edges(G_l))
-                    self.assertEqual(sorted(H.edges), sorted(H_l.edges))
-
-    def test_lazy_readout_candidates_are_exact(self):
-        rng = random.Random(2)
-        cand = lambda sccs, G: sorted(a for c in topo.maximal_components(G) for a in sccs[c])
-        for n in (2, 3, 5, 8):
-            for p in (0.0, 0.1, 0.3, 0.6, 0.9, 1.0):
-                for _ in range(15):
-                    E = random_digraph_edges(rng, n, p)
-                    _, sccs, _, _, G, _ = pipeline(n, E)
-                    known = self.lazy(n, E, "readout")
-                    _, sccs_l, _, _, G_l, _ = pipeline(n, [q for q, v in known.items() if v])
-                    self.assertEqual(cand(sccs, G), cand(sccs_l, G_l))
-
-    def test_lazy_one_scc_needs_one_cycle_for_readout(self):
-        n = 8; E = [(i, j) for i in range(n) for j in range(n) if i != j]
-        self.assertEqual(len(self.lazy(n, E, "readout")), n)
+class TestUnanimity(unittest.TestCase):
 
     def test_unanimity_answer_identity(self):
         m = LoRIT.__new__(LoRIT)
@@ -359,9 +366,6 @@ class TestCostControls(unittest.TestCase):
         self.assertTrue(m.unanimous([st("(B)"), st("2 eV")], q, "GPQA"))
         self.assertFalse(m.unanimous([st("(A)"), st("(B)")], q, "GPQA"))
 
-
-if __name__ == "__main__":
-    unittest.main()
 
 class TestRobustness(unittest.TestCase):
 
@@ -540,3 +544,6 @@ class TestBlockReadout(unittest.TestCase):
         self.assertEqual(out["lorit"]["readout"]["mode"], "llm_readout")
         self.assertNotIn("parse_error", out["lorit"]["readout"])
 
+
+if __name__ == "__main__":
+    unittest.main()

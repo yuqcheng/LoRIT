@@ -11,16 +11,9 @@ temperature: 0.5
 transitive_reduction: true
 cross_component_lifting: all_to_all
 
-rel_prompt: concise_verdict
-
-stop_on_unanimity: true
-lazy_relations: true
-judge_reasoning_chars: 0
-
 judge_temperature: 0.0
 judge_max_tokens: 512
 readout_temperature: 0.0
-max_state_chars: 400
 
 check_invariants: true
 

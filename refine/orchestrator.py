@@ -61,6 +61,8 @@ class LoRIT(Backend):
     FREEFORM_SOURCES = {"MULTIAGENTBENCH-RESEARCH": "a research proposal",
                         "MULTIAGENTBENCH-BARGAINING": "a negotiation strategy"}
 
+    MAX_STATE_CHARS = 400
+
     PH_INIT, PH_REL, PH_REL_FINAL, PH_REV, PH_READ = (
         "initial_reasoning", "relation_judgment", "relation_judgment_final", "revision", "final_readout")
 
@@ -70,9 +72,8 @@ class LoRIT(Backend):
 
         mc = dict(self.method_config or {})
         for k in ("role_mode", "num_agents", "max_rounds", "temperature", "lenses",
-                  "transitive_reduction", "cross_component_lifting", "max_state_chars",
-                  "judge_model", "judge_max_tokens", "rel_prompt", "judge_workers",
-                  "tool_checks", "max_checks", "stop_on_unanimity", "lazy_relations", "judge_reasoning_chars"):
+                  "transitive_reduction", "cross_component_lifting",
+                  "judge_model", "judge_max_tokens", "judge_workers"):
             v = general_config.get(k)
             if v is not None:
                 mc[k] = v
@@ -99,17 +100,6 @@ class LoRIT(Backend):
         self.temperature = float(mc.get("temperature", 0.7))
         self.judge_temperature = float(mc.get("judge_temperature", 0.0))
         self.judge_max_tokens = int(mc.get("judge_max_tokens", 512))
-        self.tool_checks = self._as_bool(mc.get("tool_checks", False))
-        self.max_checks = int(mc.get("max_checks", 3))
-        self.rel_prompt = mc.get("rel_prompt", "strict")
-        variants = {"strict": self._REL_SYS, "balanced": self._REL_SYS_BALANCED,
-                    "obligation": self._REL_SYS_OBLIGATION, "concise": self._REL_SYS_CONCISE,
-                    "concise_verdict": self._REL_SYS_CONCISE_VERDICT}
-        if self.rel_prompt not in variants:
-            raise ValueError(f"rel_prompt must be one of {sorted(variants)}; got {self.rel_prompt!r}")
-        self._REL_SYS = variants[self.rel_prompt]
-        if self.tool_checks:
-            self._REL_SYS = self._REL_SYS + self._REL_TOOL_CLAUSE
         self.judge_workers = int(mc.get("judge_workers") or 0) or None
         self.judge_model = mc.get("judge_model") or None
         if self.judge_model:
@@ -117,15 +107,11 @@ class LoRIT(Backend):
                 raise ValueError(f"judge_model {self.judge_model!r} is not in the model API config")
             if not all(e.get("api_key") for e in self.model_api_config[self.judge_model]["model_list"]):
                 raise RuntimeError(f"judge_model {self.judge_model!r} has no api_key resolved; "
-                                   "source ~/.lorit_secrets.env first")
+                                   "set the environment variable named by api_key_env")
         self.readout_temperature = float(mc.get("readout_temperature", 0.0))
-        self.max_state_chars = mc.get("max_state_chars", 6000)
         self.check_invariants = self._as_bool(mc.get("check_invariants", True))
-        self.stop_on_unanimity = self._as_bool(mc.get("stop_on_unanimity", False))
-        self.lazy_relations = self._as_bool(mc.get("lazy_relations", False)) and self.lifting == "all_to_all"
-        self._skipped_pairs = 0
-        jrc = mc.get("judge_reasoning_chars")
-        self.judge_reasoning_chars = None if jrc is None or str(jrc).lower() in ("", "none") else int(jrc)
+        self._judge_memo = {}
+        self._cached_pairs = 0
         self.max_workers = int(mc.get("max_workers", 8))
         self.random_seed = mc.get("random_seed", 2025)
         random.seed(self.random_seed)
@@ -140,23 +126,21 @@ class LoRIT(Backend):
         query = sample["query"]
         source = sample.get("source")
 
+        self._judge_memo = {}
         states = self.initialize_agents(query, source)
         log = {
             "problem_id": self._problem_id(sample),
             "config": {"num_agents": self.num_agents, "max_rounds": self.max_rounds,
                        "role_mode": self.role_mode, "judge_model": self.judge_model,
-                       "rel_prompt": self.rel_prompt, "tool_checks": self.tool_checks,
                        "lenses": [self.lenses[i % len(self.lenses)] for i in range(self.num_agents)],
                        "transitive_reduction": self.transitive_reduction,
-                       "cross_component_lifting": self.lifting,
-                       "stop_on_unanimity": self.stop_on_unanimity, "lazy_relations": self.lazy_relations,
-                       "judge_reasoning_chars": self.judge_reasoning_chars, "max_state_chars": self.max_state_chars},
+                       "cross_component_lifting": self.lifting},
             "initial_states": states,
             "rounds": [],
         }
 
         reusable = None
-        unanimous_at = 0 if (self.stop_on_unanimity and self.unanimous(states, query, source)) else None
+        unanimous_at = 0 if self.unanimous(states, query, source) else None
         for t in range(self.max_rounds if unanimous_at is None else 0):
             T = self.build_topology(query, states, phase=self.PH_REL)
             new_states, revised = self.revise_all_agents(query, source, states, T["H"])
@@ -176,7 +160,7 @@ class LoRIT(Backend):
                 states = new_states
                 break
             states = new_states
-            if self.stop_on_unanimity and self.unanimous(states, query, source):
+            if self.unanimous(states, query, source):
                 rec["stop"] = "unanimous"
                 unanimous_at = t + 1
                 break
@@ -204,7 +188,7 @@ class LoRIT(Backend):
             "final_C_edges": topo.edges(final_T["C"]),
             "final_G_edges": topo.edges(final_T["G"]),
             "final_stats": final_T["stats"],
-            "final_skipped_pairs": final_T.get("skipped_pairs", 0),
+            "final_cached_pairs": final_T.get("cached_pairs", 0),
             "maximal_components": readout["maximal_components"],
             "readout_candidates": readout["candidates"],
             "readout": {k: v for k, v in readout.items() if k not in ("maximal_components", "candidates")},
@@ -214,35 +198,12 @@ class LoRIT(Backend):
         })
         return {"response": answer, "lorit": log}
 
-    def run_checks(self, state, source=None, carried=None):
-        from .sandbox import clean_snippet, run_snippet
-        snippets = [clean_snippet(x) for x in (state.get("checks") or [])][:self.max_checks]
-        preamble = ""
-        if self._block_answer(source) and str(state.get("answer") or "").strip():
-            preamble = str(state["answer"]).rstrip() + "\n\n"
-        results = []
-        for code in snippets:
-            if not code:
-                continue
-            r = run_snippet(preamble + code)
-            results.append({"code": code[:1200], "ok": bool(r["ok"]), "exit": r["exit"],
-                            "stdout": r["stdout"][:400], "stderr": r["stderr"][:400]})
-        state["check_results"] = results
-        verified = list(carried or [])
-        for r in results:
-            if r["ok"] and r["code"] not in [v["code"] for v in verified]:
-                verified.append({"code": r["code"], "stdout": r["stdout"][:200]})
-        state["verified"] = verified
-        state["n_failed_checks"] = sum(1 for r in results if not r["ok"])
-        return state
-
     def initialize_agents(self, query, source):
         def one(i):
             lens = self.lenses[i % len(self.lenses)]
             raw = self.call_llm(prompt=self._solve_prompt(query, source), system_prompt=self.LENSES[lens],
                                 temperature=self.temperature, phase=self.PH_INIT)
-            st = self._parse_state(raw, source, lens, i)
-            return self.run_checks(st, source) if self.tool_checks else st
+            return self._parse_state(raw, source, lens, i)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(self.num_agents, self.max_workers)) as ex:
             return list(ex.map(one, range(self.num_agents)))
@@ -253,10 +214,10 @@ class LoRIT(Backend):
                   f"[TARGET STATE]\n{self._fmt_judge(states[j])}\n\n"
                   "Can the SOURCE state concretely refine the TARGET state? Judge only SOURCE -> TARGET. "
                   "Reply with the JSON object only.")
-        raw = self.call_llm(prompt=prompt, system_prompt=self._REL_SYS, model_name=self.judge_model,
+        raw = self.call_llm(prompt=prompt, system_prompt=self._REL_SYS_PAIR, model_name=self.judge_model,
                             temperature=self.judge_temperature, max_tokens=self.judge_max_tokens, phase=phase)
-        refines, witness, issue, ok = self._parse_judgment(raw)
-        out = {"source": i, "target": j, "refines": refines, "witness": witness, "target_issue": issue}
+        refines, ok = self._parse_judgment(raw)
+        out = {"source": i, "target": j, "refines": refines}
         if not ok:
             out["parse_error"] = True
             out["raw"] = str(raw)[:500]
@@ -264,22 +225,65 @@ class LoRIT(Backend):
 
     def infer_refinement_graph(self, query, states, phase):
         n = len(states)
-        judge = lambda p: self.infer_refinement(query, states, p[0], p[1], phase)
-        workers = self.judge_workers or self.max_workers
-        if not self.lazy_relations:
-            pairs = [(i, j) for i in range(n) for j in range(n) if i != j]
-            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-                judgments = list(ex.map(judge, pairs))
-            self._skipped_pairs = 0
-            return topo.refinement_graph_from_judgments(n, judgments), judgments
-        need = "readout" if phase == self.PH_REL_FINAL else "execution"
-        judgments, known = [], {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-            while not topo.topology_determined(n, known, need):
-                for jd in ex.map(judge, topo.lazy_next_wave(n, known, need)):
-                    judgments.append(jd); known[(jd["source"], jd["target"])] = jd["refines"] is True
-        self._skipped_pairs = n * (n - 1) - len(judgments)
+        fj = [self._fmt_judge(s) for s in states]
+        judgments, jobs = [], []
+        for j in range(n):
+            srcs = []
+            for i in range(n):
+                if i == j:
+                    continue
+                if (fj[i], fj[j]) in self._judge_memo:
+                    judgments.append({"source": i, "target": j, "refines": self._judge_memo[(fj[i], fj[j])],
+                                      "cached": True})
+                else:
+                    srcs.append(i)
+            if srcs:
+                jobs.append((j, srcs))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.judge_workers or self.max_workers) as ex:
+            for out in ex.map(lambda jb: self.infer_refinement_target(query, states, jb[0], jb[1], phase), jobs):
+                for jd in out:
+                    if not jd.get("parse_error"):
+                        self._judge_memo[(fj[jd["source"]], fj[jd["target"]])] = jd["refines"] is True
+                judgments += out
+        judgments.sort(key=lambda d: (d["source"], d["target"]))
+        self._cached_pairs = sum(1 for jd in judgments if jd.get("cached"))
         return topo.refinement_graph_from_judgments(n, judgments), judgments
+
+    def infer_refinement_target(self, query, states, j, sources, phase):
+        if len(sources) == 1:
+            return [self.infer_refinement(query, states, sources[0], j, phase)]
+        labels = [f"S{k + 1}" for k in range(len(sources))]
+        prompt = (f"PROBLEM:\n{query}\n\n[TARGET STATE]\n{self._fmt_judge(states[j])}\n\n"
+                  + "".join(f"[SOURCE {lab}]\n{self._fmt_judge(states[i])}\n\n" for lab, i in zip(labels, sources))
+                  + f"For each SOURCE ({', '.join(labels)}), can it concretely refine the TARGET state? "
+                    "Judge each SOURCE -> TARGET on its own. Reply with the JSON object only.")
+        raw = self.call_llm(prompt=prompt, system_prompt=self._REL_SYS_TARGET, model_name=self.judge_model,
+                            temperature=self.judge_temperature, max_tokens=self.judge_max_tokens, phase=phase)
+        got = self._parse_target_verdicts(raw, labels)
+        out = []
+        for lab, i in zip(labels, sources):
+            if lab in got:
+                out.append({"source": i, "target": j, "refines": got[lab]})
+            else:
+                jd = self.infer_refinement(query, states, i, j, phase)
+                jd["batch_fallback"] = True
+                out.append(jd)
+        return out
+
+    def _parse_target_verdicts(self, raw, labels):
+        text = str(raw or "")
+        got = {}
+        obj, _ = self._last_json(text, tuple(labels))
+        if isinstance(obj, dict):
+            for lab in labels:
+                v = obj.get(lab)
+                lv = v.strip().lower() if isinstance(v, str) else None
+                if isinstance(v, bool) or lv in ("true", "false", "yes", "no"):
+                    got[lab] = v is True or lv in ("true", "yes")
+        for lab, v in re.findall(r'"?\b(S\d+)\b"?\s*:\s*(true|false)', text, re.IGNORECASE):
+            if lab in labels and lab not in got:
+                got[lab] = v.lower() == "true"
+        return got
 
     def build_topology(self, query, states, phase):
         D, judgments = self.infer_refinement_graph(query, states, phase)
@@ -289,7 +293,7 @@ class LoRIT(Backend):
         if self.check_invariants:
             topo.check_invariants(D, sccs, a2c, C, G, H, self.lifting)
         return {"judgments": judgments, "D": D, "sccs": sccs, "agent_to_component": a2c, "C": C, "G": G,
-                "H": H, "stats": topo.topology_statistics(D, C, G, H, sccs), "skipped_pairs": self._skipped_pairs}
+                "H": H, "stats": topo.topology_statistics(D, C, G, H, sccs), "cached_pairs": self._cached_pairs}
 
     def final_refinement_topology(self, query, states):
         return self.build_topology(query, states, phase=self.PH_REL_FINAL)
@@ -303,8 +307,6 @@ class LoRIT(Backend):
         new = self._parse_state(raw, source, states[j]["lens"], j)
         if not new["answer"]:
             new = dict(states[j], revision_parse_failed=True)
-        elif self.tool_checks:
-            new = self.run_checks(new, source, carried=states[j].get("verified"))
         return new, True
 
     def revise_all_agents(self, query, source, states, H):
@@ -369,7 +371,7 @@ class LoRIT(Backend):
             "G_edges": topo.edges(T["G"]),
             "H_edges": [[int(i), int(j), T["H"].edges[i, j]["kind"]] for i, j in sorted(T["H"].edges)],
             "stats": T["stats"],
-            "skipped_pairs": T.get("skipped_pairs", 0),
+            "cached_pairs": T.get("cached_pairs", 0),
         }
 
     def _revision_events(self, t, before, after, T):
@@ -408,77 +410,19 @@ class LoRIT(Backend):
                 return str(sample[k])
         return hashlib.sha1(str(sample["query"]).encode("utf-8")).hexdigest()[:16]
 
-    _REL_SYS = (
-        "You judge ONE directed relation between two reasoning states for the same problem: can the SOURCE "
-        "state concretely refine the TARGET state?\n"
-        "SOURCE refines TARGET only if SOURCE contains actionable reasoning content that corrects, completes, "
-        "strengthens, or resolves a SPECIFIC weakness in TARGET, for example: correcting a concrete logical "
-        "or factual error; supplying a missing derivation; resolving one of TARGET's open obligations; "
-        "identifying a constraint TARGET overlooked; providing a counterexample to TARGET; repairing an "
-        "invalid intermediate step.\n"
-        "NOT a refinement: agreeing with TARGET; merely stating a different or the same final answer; being "
-        "longer or more confident; repeating what TARGET already establishes.\n"
-        "This is one direction only. Whether TARGET could refine SOURCE is a separate question and must not "
-        "affect your verdict; both directions can be true at once.\n"
-        "Output exactly one JSON object and nothing else:\n"
-        '{"target_issue": "<the specific weakness in TARGET, or empty>", '
-        '"witness": "<the concrete content in SOURCE that resolves it, or empty>", '
-        '"refines": true or false}'
-    )
-
-    _REL_SYS_BALANCED = (
-        "You judge ONE directed relation between two reasoning states for the same problem: would the TARGET "
-        "state be improved by incorporating content the SOURCE state already has?\n"
-        "Answer true if SOURCE has at least one concrete thing TARGET lacks, for example: a correction of an "
-        "error in TARGET; a derivation or justification TARGET states without support or skips; a check, case "
-        "or constraint TARGET does not handle; evidence that discharges one of TARGET's open obligations; a "
-        "reformulation that makes a step TARGET leaves implicit verifiable.\n"
-        "Answer false if SOURCE adds nothing TARGET does not already have: it merely agrees, restates the "
-        "same answer, is longer or more confident, or differs only in wording.\n"
-        "TARGET reaching the same final answer does NOT by itself make the answer false: judge the reasoning "
-        "content, not the answer.\n"
-        "This is one direction only. Whether TARGET could improve SOURCE is a separate question and must not "
-        "affect your verdict; both directions can be true at once.\n"
-        "Output exactly one JSON object and nothing else:\n"
-        '{"target_issue": "<what TARGET lacks, or empty>", '
-        '"witness": "<the content in SOURCE that supplies it, or empty>", '
-        '"refines": true or false}'
-    )
-
-    _REL_TOOL_CLAUSE = (
-        "\nBoth states may carry TOOL CHECKS that were executed in a sandbox. Treat them as the hardest "
-        "evidence available: a FAILED check in TARGET is a concrete, named defect, and SOURCE content that "
-        "would fix it is a refinement. A PASSED check in SOURCE covering something TARGET only asserts is a "
-        "refinement. Passing checks in TARGET that SOURCE lacks count AGAINST refinement. Never treat a "
-        "state as refining another merely because it ran more checks."
-    )
-
-    _REL_SYS_OBLIGATION = (
-        "You judge ONE directed relation between two reasoning states for the same problem: does the SOURCE "
-        "state resolve something the TARGET state leaves open or unsupported?\n"
-        "Answer true if SOURCE settles a point TARGET leaves unsettled: one of TARGET's open obligations, a "
-        "step TARGET asserts without justification, a case or constraint TARGET does not check, or an error "
-        "in TARGET. Being more complete on a specific point is enough; SOURCE need not be better overall.\n"
-        "Answer false if TARGET already establishes everything SOURCE offers, or SOURCE only agrees, repeats, "
-        "or is merely more verbose.\n"
-        "This is one direction only; both directions can be true at once.\n"
-        "Output exactly one JSON object and nothing else:\n"
-        '{"target_issue": "<the open or unsupported point in TARGET, or empty>", '
-        '"witness": "<what in SOURCE settles it, or empty>", '
-        '"refines": true or false}'
-    )
-
-    _REL_SYS_CONCISE = (
+    _REL_SYS_PAIR = (
         "For the same problem, does SOURCE provide actionable reasoning to fix a specific weakness in TARGET? "
         "Agreement, answer differences, verbosity, confidence, or repetition alone do not qualify. "
         "Judge SOURCE\u2192TARGET independently; both directions may hold.\n"
-        "Output exactly one JSON object and nothing else:\n"
-        '{"target_issue": "<the specific weakness in TARGET, or empty>", '
-        '"witness": "<the concrete content in SOURCE that resolves it, or empty>", '
-        '"refines": true or false}'
-    )
-    _REL_SYS_CONCISE_VERDICT = _REL_SYS_CONCISE.split("Output exactly")[0] + (
         'Output exactly one JSON object and nothing else: {"refines": true or false}')
+
+    _REL_SYS_TARGET = (
+        "For the same problem, does each SOURCE provide actionable reasoning to fix a specific weakness in TARGET? "
+        "Agreement, answer differences, verbosity, confidence, or repetition alone do not qualify. "
+        "Judge each SOURCE\u2192TARGET on its own, independently of the other SOURCEs; any number of them may "
+        "qualify.\n"
+        'Output exactly one JSON object and nothing else, one key per SOURCE label: '
+        '{"S1": true or false, "S2": true or false, ...}')
 
     _READOUT_SYS = (
         "You produce the final answer of a multi-agent reasoning system from its remaining candidate "
@@ -502,13 +446,6 @@ class LoRIT(Backend):
             return 'the final numeric value only, e.g. "18"'
         return "your final answer, as short as possible"
 
-    _CODE_CHECK_NOTE = (
-        "\nAlso add a \"checks\" list to that JSON object: at most {n} self-contained Python snippets that "
-        "define or import your implementation and then assert properties of it (edge cases, types, small "
-        "examples you worked out yourself). Each is run in a sandbox; a failing one is evidence against your "
-        "implementation. Do NOT invent or guess the grader's hidden tests -- write your own."
-    )
-
     _CODE_CONTRACT = (
         "Then give your FINAL IMPLEMENTATION as a single ```python code block: the complete function, "
         "including its signature and every import it needs, ready to run as-is. No tests, no example calls, "
@@ -529,36 +466,17 @@ class LoRIT(Backend):
         "Be honest in open_obligations. Naming a genuine gap is more useful than claiming none."
     )
 
-    _CHECK_CLAUSE = (
-        '\n "checks": ["<a self-contained Python snippet that VERIFIES one of your claims: it must exit '
-        'non-zero (e.g. raise AssertionError) if the claim is false, and print nothing sensitive. No network, '
-        'no file access, no input()>"]'
-    )
-
-    def _checks_note(self, n):
-        return (f"\nAdd at most {n} entries to \"checks\". Each one is run in a sandbox and its result is "
-                "attached to your state: a passing check marks the claim it tests as verified, a failing check "
-                "is evidence against your own reasoning and you should say so in open_obligations. Write checks "
-                "that could actually fail -- a check that trivially passes verifies nothing.")
-
     def _contract(self, source):
-        if self._is_code(source) and self.tool_checks:
-            return (self._CODE_CONTRACT.replace(
-                '{"established": ["<a step or property you have actually established>"],\n',
-                '{"established": ["<a step or property you have actually established>"],\n')
-                + self._CODE_CHECK_NOTE.format(n=self.max_checks))
         if self._is_freeform(source):
             return self._FREEFORM_CONTRACT.format(what=self.FREEFORM_SOURCES[(source or "").upper()])
         if self._is_code(source):
             return self._CODE_CONTRACT
-        base = ("Then output your reasoning state as ONE JSON object on the LAST line, no code fences:\n"
+        return ("Then output your reasoning state as ONE JSON object on the LAST line, no code fences:\n"
                 '{"answer": "<' + self._answer_format(source) + '>",\n'
                 ' "established": ["<a step or fact you have actually established>"],\n'
                 ' "open_obligations": ["<something you have NOT verified: an unchecked case, an assumption, '
-                'an incomplete step>"]'
-                + (self._CHECK_CLAUSE if self.tool_checks else "") + '}\n'
+                'an incomplete step>"]}\n'
                 "Be honest in open_obligations. Naming a genuine gap is more useful than claiming none.")
-        return base + (self._checks_note(self.max_checks) if self.tool_checks else "")
 
     def _solve_prompt(self, query, source):
         if self.role_mode == "domain":
@@ -579,11 +497,6 @@ class LoRIT(Backend):
             "information your state is missing. They are not guaranteed to be correct.\n\n"
             f"{blocks}\n\n"
             "=== INSTRUCTIONS ===\n"
-            + ("- Your state carries TOOL CHECKS that passed. Those claims are verified: keep them, and keep "
-               "any implementation detail they depend on. You may add to them, you may not drop or contradict "
-               "them without a check of your own that fails.\n"
-               "- If one of YOUR checks failed, treat that as a concrete defect and fix it first.\n"
-               if self.tool_checks else "") +
             "- Preserve the parts of your current reasoning that are already valid.\n"
             "- Inspect each upstream state for concrete corrections, missing derivations, overlooked "
             "constraints, counterexamples, or content that resolves one of your open obligations.\n"
@@ -619,52 +532,26 @@ class LoRIT(Backend):
                '{"answer": "<' + self._answer_format(source) + '>"}')
         )
 
-    def _checks_block(self, s):
-        if not self.tool_checks:
-            return ""
-        res = s.get("check_results") or []
-        ver = s.get("verified") or []
-        if not res and not ver:
-            return "\nTOOL CHECKS: none run\n"
-        lines = []
-        for r in res:
-            head = "PASSED" if r["ok"] else "FAILED"
-            detail = (r["stdout"] or "").strip().replace("\n", " ")[:120] if r["ok"] else \
-                     (r["stderr"] or "").strip().splitlines()[-1][:160] if (r["stderr"] or "").strip() else ""
-            lines.append(f"  [{head}] {r['code'].splitlines()[0][:90]} -> {detail}")
-        extra = len(ver) - sum(1 for r in res if r["ok"])
-        if extra > 0:
-            lines.append(f"  [VERIFIED EARLIER] {extra} check(s) from a previous round still hold")
-        return "\nTOOL CHECKS (run in a sandbox, not written by the grader):\n" + "\n".join(lines) + "\n"
-
     def _fmt_judge(self, s):
-        n = self.judge_reasoning_chars
-        if n is None or s.get("state_parse_failed"):
+        if s.get("state_parse_failed"):
             return self._fmt(s)
-        r = str(s.get("reasoning", "") or "").strip()
-        if n <= 0:
-            r = "(not shown; judge from the answer, established facts and open obligations)"
-        elif len(r) > n:
-            r = r[:n // 2] + "\n[... middle of reasoning truncated ...]\n" + r[-(n - n // 2):]
-        return self._fmt({**s, "reasoning": r})
+        return self._fmt({**s, "reasoning": "(not shown; judge from the answer, established facts and open obligations)"})
 
     def _fmt(self, s):
         if "\n" in str(s["answer"]):
             return (f"IMPLEMENTATION:\n```python\n{s['answer']}\n```\n"
                     f"REASONING:\n{self._clip(s.get('reasoning', '')) or '(none)'}\n"
                     "ESTABLISHED:\n" + ("\n".join(f"  - {x}" for x in s["established"]) or "  (none)")
-                    + "\nOPEN OBLIGATIONS:\n" + ("\n".join(f"  - {x}" for x in s["open_obligations"]) or "  (none)")
-                    + self._checks_block(s))
+                    + "\nOPEN OBLIGATIONS:\n" + ("\n".join(f"  - {x}" for x in s["open_obligations"]) or "  (none)"))
         return (f"ANSWER: {s['answer']}\n"
                 f"REASONING:\n{self._clip(s.get('reasoning', '')) or '(none)'}\n"
                 "ESTABLISHED:\n" + ("\n".join(f"  - {x}" for x in s["established"]) or "  (none)")
-                + "\nOPEN OBLIGATIONS:\n" + ("\n".join(f"  - {x}" for x in s["open_obligations"]) or "  (none)")
-                + self._checks_block(s))
+                + "\nOPEN OBLIGATIONS:\n" + ("\n".join(f"  - {x}" for x in s["open_obligations"]) or "  (none)"))
 
     def _clip(self, text):
         text = str(text or "").strip()
-        m = self.max_state_chars
-        if not m or len(text) <= m:
+        m = self.MAX_STATE_CHARS
+        if len(text) <= m:
             return text
         half = int(m) // 2
         return text[:half] + "\n[... middle of reasoning truncated ...]\n" + text[-half:]
@@ -719,8 +606,7 @@ class LoRIT(Backend):
         state = {"agent": agent, "lens": lens, "answer": answer, "norm": normalize_answer(answer, source),
                  "reasoning": reasoning,
                  "established": self._strs(obj.get("established")),
-                 "open_obligations": self._strs(obj.get("open_obligations")),
-                 "checks": self._snippets(obj.get("checks"), limit=self.max_checks)}
+                 "open_obligations": self._strs(obj.get("open_obligations"))}
         if status:
             state[status] = True
         return state
@@ -735,8 +621,7 @@ class LoRIT(Backend):
         state = {"agent": agent, "lens": lens, "answer": code, "norm": normalize_answer(code, source),
                  "reasoning": reasoning,
                  "established": self._strs((obj or {}).get("established")),
-                 "open_obligations": self._strs((obj or {}).get("open_obligations")),
-                 "checks": self._snippets((obj or {}).get("checks"), limit=self.max_checks)}
+                 "open_obligations": self._strs((obj or {}).get("open_obligations"))}
         if not code:
             state["state_parse_failed"] = True
         return state
@@ -747,26 +632,11 @@ class LoRIT(Backend):
         if obj is not None:
             v = obj.get("refines")
             lv = v.strip().lower() if isinstance(v, str) else None
-            refines = v is True or lv in ("true", "yes")
-            ok = isinstance(v, bool) or lv in ("true", "false", "yes", "no")
-            return refines, str(obj.get("witness", "") or ""), str(obj.get("target_issue", "") or ""), ok
+            return v is True or lv in ("true", "yes"), isinstance(v, bool) or lv in ("true", "false", "yes", "no")
         m = re.search(r'"?refines"?\s*:\s*(true|false)', text, re.IGNORECASE)
         if m:
-            return m.group(1).lower() == "true", "", "", True
-        return False, "", "", False
-
-    def _snippets(self, x, limit=3):
-        if x is None:
-            return []
-        items = [x] if isinstance(x, str) else (list(x) if isinstance(x, (list, tuple)) else [x])
-        out = []
-        for it in items:
-            t = str(it).strip()[:2000]
-            if t and t not in out:
-                out.append(t)
-            if len(out) >= limit:
-                break
-        return out
+            return m.group(1).lower() == "true", True
+        return False, False
 
     def _strs(self, x, limit=8):
         if x is None:

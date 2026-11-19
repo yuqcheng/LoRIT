@@ -25,16 +25,18 @@ def topology_stats(records):
         return {}
     n = len(ok[0]["lorit"]["config"]["lenses"]) or 1
     pairs = max(n * (n - 1), 1)
+    built = [r for r in ok if r["lorit"]["final_stats"]]
 
-    def mean(f):
-        return round(st.mean(f(r) for r in ok), 3)
+    def mean(rs, f):
+        return round(st.mean(f(r) for r in rs), 3) if rs else None
 
     return {"num_agents": n,
-            "D_density": mean(lambda r: r["lorit"]["final_stats"]["E_D"] / pairs),
-            "num_sccs": mean(lambda r: len(r["lorit"]["final_sccs"])),
-            "G_edges": mean(lambda r: r["lorit"]["final_stats"]["E_G"]),
-            "readout_candidates": mean(lambda r: len(r["lorit"]["readout_candidates"])),
-            "rounds_run": mean(lambda r: r["lorit"]["num_rounds_run"])}
+            "stopped_unanimous": round(1 - len(built) / len(ok), 3),
+            "D_density": mean(built, lambda r: r["lorit"]["final_stats"]["E_D"] / pairs),
+            "num_sccs": mean(built, lambda r: len(r["lorit"]["final_sccs"])),
+            "G_edges": mean(built, lambda r: r["lorit"]["final_stats"]["E_G"]),
+            "readout_candidates": mean(ok, lambda r: len(r["lorit"]["readout_candidates"])),
+            "rounds_run": mean(ok, lambda r: r["lorit"]["num_rounds_run"])}
 
 def main():
     if len(sys.argv) < 2:

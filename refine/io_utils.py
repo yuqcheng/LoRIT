@@ -19,7 +19,7 @@ def load_backends(path, model_name):
                 entry["api_key"] = key
             elif name == model_name:
                 raise RuntimeError(f"{model_name}: environment variable {entry['api_key_env']} is not set; "
-                                   f"source ~/.lorit_secrets.env first")
+                                   "set it before running")
     for model_name in model_api_config:
         actural_max_workers = model_api_config[model_name]["max_workers_per_model"] * len(model_api_config[model_name]["model_list"])
         model_api_config[model_name]["max_workers"] = actural_max_workers
